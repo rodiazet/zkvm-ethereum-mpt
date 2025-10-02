@@ -126,30 +126,30 @@ impl Trie {
         self.0.resolve_digests(&rlp_by_digest)
     }
 
-    /// Converts the trie into a [CachedTrie].
-    pub fn into_cached(self) -> CachedTrie {
-        fn rec(root: Node<NoCache>) -> Node<Cache> {
-            match root {
-                Node::Null => Node::Null,
-                Node::Leaf(prefix, value, _) => Node::Leaf(prefix, value, Cache::default()),
-                Node::Extension(prefix, child, _) => {
-                    Node::Extension(prefix, rec(*child).into(), Cache::default())
-                }
-                Node::Branch(children, _) => {
-                    let mut cached_children = Children::default();
-                    for (i, child) in children.into_iter().enumerate() {
-                        if let Some(child) = child {
-                            cached_children.insert(i as u8, rec(*child).into());
-                        }
-                    }
-                    Node::Branch(cached_children, Cache::default())
-                }
-                Node::Digest(digest) => Node::Digest(digest),
-            }
-        }
-
-        CachedTrie { inner: rec(self.0), hash: None }
-    }
+    // /// Converts the trie into a [CachedTrie].
+    // pub fn into_cached(self) -> CachedTrie {
+    //     fn rec(root: Node<NoCache>) -> Node<Cache> {
+    //         match root {
+    //             Node::Null => Node::Null,
+    //             Node::Leaf(prefix, value, _) => Node::Leaf(prefix, value, Cache::default()),
+    //             Node::Extension(prefix, child, _) => {
+    //                 Node::Extension(prefix, rec(*child).into(), Cache::default())
+    //             }
+    //             Node::Branch(children, _) => {
+    //                 let mut cached_children = Children::default();
+    //                 for (i, child) in children.into_iter().enumerate() {
+    //                     if let Some(child) = child {
+    //                         cached_children.insert(i as u8, rec(*child).into());
+    //                     }
+    //                 }
+    //                 Node::Branch(cached_children, Cache::default())
+    //             }
+    //             Node::Digest(digest) => Node::Digest(digest),
+    //         }
+    //     }
+    // 
+    //     CachedTrie { inner: rec(self.0), hash: None }
+    // }
 
     /// Returns the RLP-encoded nodes of the trie in preorder. It may return duplicate nodes.
     ///
@@ -232,7 +232,7 @@ pub struct CachedTrie {
         serde(with = "serde::rlp_nodes")
     )]
     #[cfg_attr(all(feature = "rkyv", feature = "rlp_serialize"), rkyv(with = rkyv::RlpNodes))]
-    inner: Node<Cache>,
+    inner: Node<NoCache>,
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(feature = "rkyv", rkyv(with = ::rkyv::with::Skip))]
     hash: Option<B256>,
