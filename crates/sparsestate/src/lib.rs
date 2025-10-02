@@ -130,7 +130,7 @@ impl StatelessTrie for SparseState {
             .collect();
 
         // construct the state trie from the witness data and the given state root
-        let state = RlpTrie::from_prehashed(pre_state_root, &rlp_by_digest)
+        let mut state = RlpTrie::from_prehashed(pre_state_root, &rlp_by_digest)
             .map_err(|_| StatelessValidationError::WitnessRevealFailed { pre_state_root })?;
 
         // hash all the supplied bytecode
@@ -140,10 +140,34 @@ impl StatelessTrie for SparseState {
             .map(|code| (keccak256(code), Bytecode::new_raw(code.clone())))
             .collect();
 
+        let storages: RefCell<B256Map<RlpTrie<U256>>> = RefCell::new(B256Map::default());
+
+        // get all accounts with non-empty storage
+        for key in witness.keys.iter().filter(|key|key.len() == 20) {
+            let hashed_address = keccak256(key);
+            let account = state.get(hashed_address)
+                .map_err(|_| StatelessValidationError::WitnessRevealFailed { pre_state_root })?;
+            if account.is_some() {
+                let account: TrieAccount = account.unwrap();
+                if account.storage_root != EMPTY_ROOT_HASH {
+
+                    match storages.borrow_mut().entry(hashed_address) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(RlpTrie::from_prehashed(
+                                account.storage_root,
+                                &rlp_by_digest,
+                            ).map_err(|_| StatelessValidationError::WitnessRevealFailed { pre_state_root })?);
+                        }
+                        Entry::Occupied(_) => {}
+                    }
+                }
+            }
+        }
+
         Ok((
             Self {
                 state,
-                storages: RefCell::new(B256Map::default()),
+                storages,
                 rlp_by_digest,
             },
             bytecode,
@@ -156,17 +180,17 @@ impl StatelessTrie for SparseState {
         match self.state.get(hashed_address)? {
             None => Ok(None),
             Some(account) => {
-                // each time an account is accessed, check whether its storage trie already exists
-                // otherwise construct it from the witness data and the account's storage root
-                match self.storages.borrow_mut().entry(hashed_address) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(RlpTrie::from_prehashed(
-                            account.storage_root,
-                            &self.rlp_by_digest,
-                        )?);
-                    }
-                    Entry::Occupied(_) => {}
-                }
+                // // each time an account is accessed, check whether its storage trie already exists
+                // // otherwise construct it from the witness data and the account's storage root
+                // match self.storages.borrow_mut().entry(hashed_address) {
+                //     Entry::Vacant(entry) => {
+                //         entry.insert(RlpTrie::from_prehashed(
+                //             account.storage_root,
+                //             &self.rlp_by_digest,
+                //         )?);
+                //     }
+                //     Entry::Occupied(_) => {}
+                // }
 
                 Ok(Some(account))
             }
