@@ -1,252 +1,213 @@
-//! Provides an optimized sparse MPT implementation for the stateless validator guest program.
-#![allow(warnings)]
+//! Provides an implementation of a sparse MPT using alloy-trie::HashBuilder struct for the stateless validator guest program.
 
-// Copyright 2025 RISC Zero, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-use core::marker::PhantomData;
-use std::{cell::RefCell, collections::hash_map::Entry};
-
-use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, keccak256, map::B256Map};
-use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount};
-use mpt::CachedTrie;
-use reth_errors::ProviderError;
-use reth_stateless::{ExecutionWitness, StatelessTrie, validation::StatelessValidationError};
+use std::collections::VecDeque;
+use alloy_primitives::{B256, Address, U256, keccak256, Bytes, map::HashMap, map::FbBuildHasher, KECCAK256_EMPTY};
+use alloy_trie::{HashBuilder, Nibbles, TrieAccount, nodes::RlpNode, nodes::TrieNode, EMPTY_ROOT_HASH};
 use reth_trie_common::HashedPostState;
+use reth_errors::ProviderError;
+use reth_stateless::{ExecutionWitness, StatelessTrie};
+use reth_stateless::validation::StatelessValidationError;
+use alloy_rlp::{encode, Decodable};
 use revm_bytecode::Bytecode;
 
-/// Zero-overhead helper for tries that only contain RLP encoded data.
-#[derive(Debug, Clone, Default)]
-#[repr(transparent)]
-struct RlpTrie<T> {
-    inner: CachedTrie,
-    phantom: PhantomData<T>,
+/// Added to make the IDE happy. It is the same as `alloy_primitives::map::B256Map`
+pub type B256Map<V> = HashMap<B256, V, FbBuildHasher<32>>;
+
+#[derive(Debug)]
+struct HashBuilderTrie<ValueType> {
+    hash_builder : HashBuilder,
+    values: B256Map<ValueType>,
 }
 
-impl<T: alloy_rlp::Decodable + alloy_rlp::Encodable> RlpTrie<T> {
-    fn new(inner: CachedTrie) -> Self {
-        Self {
-            inner,
-            phantom: PhantomData,
+/// The HashBuilder based sparse state trie
+#[derive(Debug)]
+pub struct HashBuilderSparseState {
+    accounts : HashBuilderTrie<TrieAccount>,
+    storages : B256Map<HashBuilderTrie<U256>>,
+}
+
+// A struct to store node data when building the trie from the execution witness.
+struct NodeHashAndPath {
+    // Hash of a node. It can be a hash of a branch/extension or leaf node.
+    hash : B256,
+    // Full path of the node in the trie.
+    path : Nibbles,
+}
+
+// Trait which defines an interface of the trie leaf node value processing. It's necessary to
+// process differently an account leaf and a storage leaf.
+trait LeafValueProcessor {
+    fn process_leaf_value(&mut self, path: &Nibbles, value : &mut Vec<u8>);
+}
+
+struct AccountTrieLeafValueProcessor<'a> {
+    accounts : B256Map<TrieAccount>,
+    storages : B256Map<HashBuilderTrie<U256>>,
+    hash2rlp_map: &'a B256Map<Bytes>
+}
+
+#[derive(Default)]
+struct StorageTrieLeafValueProcessor {
+    storages : B256Map<U256>
+}
+
+// Storage leaf processing. It adds storage value to a storage map only.
+impl LeafValueProcessor for StorageTrieLeafValueProcessor {
+    fn process_leaf_value(&mut self, path: &Nibbles, value : &mut Vec<u8>) {
+        self.storages.insert(B256::from_slice(&*path.pack()), U256::decode(&mut &value[..]).unwrap());
+    }
+}
+
+// Account trie leaf node processor. It adds an account to the account map and builds the account
+// storage map sing `StorageTrieLeafValueProcessor`.
+impl LeafValueProcessor for AccountTrieLeafValueProcessor<'_> {
+    fn process_leaf_value(&mut self, path: &Nibbles, value : &mut Vec<u8>) {
+        let account : TrieAccount = TrieAccount::decode(&mut &value[..]).unwrap();
+
+        let mut storage_leaf_processor = StorageTrieLeafValueProcessor::default();
+        if account.storage_root != EMPTY_ROOT_HASH {
+            let storage_hash_builder = build_hash_builder_trie::<StorageTrieLeafValueProcessor>(self.hash2rlp_map, &account.storage_root, &mut storage_leaf_processor);
+
+            self.storages.insert(
+                account.storage_root.clone(),
+                HashBuilderTrie::<U256> { hash_builder : storage_hash_builder, values : storage_leaf_processor.storages }
+            );
+        }
+        self.accounts.insert(B256::from_slice(&*path.pack()), account);
+    }
+}
+
+// Builds the MPT trie using `HashBuilder` to calculate the state root of th trie.
+fn build_hash_builder_trie<ValueProcessor : LeafValueProcessor>(
+    hash2rlp_map: &B256Map<Bytes>,
+    state_root : &B256,
+    value_processor: &mut ValueProcessor) -> HashBuilder {
+    let mut hash_builder = HashBuilder::default();
+
+    // Init the queue with the state root hash and empty path.
+    let mut queue : VecDeque<NodeHashAndPath> = VecDeque::from([NodeHashAndPath{hash : state_root.clone(), path : Nibbles::default()}]);
+
+    while let Some(node) = queue.pop_back() {
+        // Check whether the node with the hash exists in the hash to rlp (witness) map. If not it must be a "blind" branch node.
+        // This is a subtrie of which we know the root hash only. We add it as a banch node.
+        let Some(node_rlp) = hash2rlp_map.get(&node.hash) else {
+            hash_builder.add_branch(node.path, node.hash, false);
+            continue;
+        };
+        match TrieNode::decode(&mut &node_rlp[..]).unwrap()
+        {
+            // The HashBuilder requires ascending sorted nodes when adding. We use DFS and add
+            // branch node children starting from right.
+            TrieNode::Branch(branch_node) => {
+                // TODO: Iterate children backwards without collecting
+                for (idx, maybe_child) in branch_node.as_ref().children().collect::<Vec<(u8, Option<&RlpNode>)>>().iter().rev() {
+                    if let Some(child_hash) = maybe_child.and_then(RlpNode::as_hash) {
+                        // Build the child path from the branch node path and the child index in the branch node.
+                        let mut child_path = node.path.clone();
+                        child_path.push_unchecked(idx.clone());
+                        queue.push_back(NodeHashAndPath{hash : child_hash, path : child_path});
+                    }
+                }
+            }
+            TrieNode::Extension(extension_node) => {
+                // Build the child path from the extension node path and the extension node common key.
+                let mut child_path = node.path.clone();
+                child_path.extend(&extension_node.key);
+                queue.push_back(NodeHashAndPath{hash : extension_node.child.as_hash().unwrap(), path : child_path });
+            }
+            TrieNode::Leaf(mut leaf_node) => {
+                // Build the full path with the parent path and the leaf key.
+                let mut full_path = node.path.clone();
+                full_path.extend(&leaf_node.key);
+                hash_builder.add_leaf(full_path, &leaf_node.value);
+                value_processor.process_leaf_value(&full_path, &mut leaf_node.value);
+            }
+            _ => {
+                unimplemented!()
+            }
         }
     }
 
-    pub fn from_prehashed(
-        root: B256,
-        rlp_by_digest: &B256Map<impl AsRef<[u8]>>,
-    ) -> alloy_rlp::Result<Self> {
-        Ok(Self::new(CachedTrie::from_prehashed_nodes(
-            root,
-            rlp_by_digest,
-        )?))
+    // We need to clear the hash builder internal state.
+    // Unfortunately, there is no public function to do it. We do it by calling root() which does it.
+    // It is necessary when taking an account. `account` implementation asserts that the internal
+    // state is cleared.
+    if !hash_builder.key.is_empty() {
+        let _ = hash_builder.root();
     }
 
-    pub fn get(&self, key: impl AsRef<[u8]>) -> alloy_rlp::Result<Option<T>> {
-        self.inner.get(key).map(alloy_rlp::decode_exact).transpose()
-    }
-
-    pub fn insert(&mut self, key: impl AsRef<[u8]>, value: T) {
-        self.inner.insert(key, alloy_rlp::encode(value));
-    }
-
-    pub fn remove(&mut self, key: impl AsRef<[u8]>) -> bool {
-        self.inner.remove(key)
-    }
-
-    pub fn hash(&mut self) -> B256 {
-        self.inner.hash()
-    }
+    hash_builder
 }
 
-/// Represents a sparse version of the Ethereum world state.
-/// This is significantly more performant than the Reth default.
-#[derive(Debug, Clone)]
-pub struct SparseState {
-    /// state MPT containing all used accounts
-    state: RlpTrie<TrieAccount>,
-    /// storage MPTs sorted by the hashed address of their account
-    storages: RefCell<B256Map<RlpTrie<U256>>>,
 
-    /// all relevant MPT nodes by their Keccak hash
-    rlp_by_digest: B256Map<Bytes>,
-}
-
-impl SparseState {
-    /// Removes an account from the state.
-    fn remove_account(&mut self, hashed_address: &B256) {
-        self.state.remove(hashed_address);
-        self.storages.get_mut().remove(hashed_address);
-    }
-
-    /// Clears the storage of an account.
-    fn clear_storage(&mut self, hashed_address: B256) -> &mut RlpTrie<U256> {
-        self.storages
-            .get_mut()
-            .entry(hashed_address)
-            .insert_entry(RlpTrie::default())
-            .into_mut()
-    }
-
-    /// Returns a mutable version of the storage trie of the given account.
-    fn storage_trie_mut(&mut self, hashed_address: B256) -> alloy_rlp::Result<&mut RlpTrie<U256>> {
-        let trie = match self.storages.get_mut().entry(hashed_address) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                // build the storage trie matching the storage root of the account
-                let storage_root = self
-                    .state
-                    .get(hashed_address)?
-                    .map_or(EMPTY_ROOT_HASH, |a| a.storage_root);
-                entry.insert(RlpTrie::from_prehashed(storage_root, &self.rlp_by_digest)?)
-            }
-        };
-
-        Ok(trie)
-    }
-}
-
-impl StatelessTrie for SparseState {
-    /// Initialize the stateless trie using the `ExecutionWitness`.
+impl StatelessTrie for HashBuilderSparseState {
     fn new(
         witness: &ExecutionWitness,
         pre_state_root: B256,
     ) -> Result<(Self, B256Map<Bytecode>), StatelessValidationError> {
-        // fist, hash all the RLP nodes once
-        let rlp_by_digest: B256Map<_> = witness
-            .state
-            .iter()
-            .map(|rlp| (keccak256(rlp), rlp.clone()))
-            .collect();
 
-        // construct the state trie from the witness data and the given state root
-        let state = RlpTrie::from_prehashed(pre_state_root, &rlp_by_digest)
-            .map_err(|_| StatelessValidationError::WitnessRevealFailed { pre_state_root })?;
+        // Build the state map hash -> rlp rep of the trie nodes.
+        let hash2rlp_map : B256Map<Bytes> = witness.state.iter().map(|value| (keccak256(value), value.clone()) ).collect::<B256Map<_>>();
 
-        // hash all the supplied bytecode
-        let bytecode = witness
-            .codes
-            .iter()
-            .map(|code| (keccak256(code), Bytecode::new_raw(code.clone())))
-            .collect();
+        // Prepare leaf node value processor.
+        let mut account_processor = AccountTrieLeafValueProcessor::<'_> {
+            accounts : B256Map::<TrieAccount>::default(),
+            storages : B256Map::<HashBuilderTrie<U256>>::default(),
+            hash2rlp_map: &hash2rlp_map
+        };
 
-        Ok((
-            Self {
-                state,
-                storages: RefCell::new(B256Map::default()),
-                rlp_by_digest,
-            },
-            bytecode,
-        ))
+        // Build the trie.
+        let hb = build_hash_builder_trie(&hash2rlp_map, &pre_state_root, &mut account_processor);
+
+        let accounts = HashBuilderTrie{ hash_builder: hb, values: account_processor.accounts };
+
+        // TODO: Build the bytecode map
+        Ok((HashBuilderSparseState { accounts, storages: account_processor.storages }, B256Map::default()))
     }
 
-    /// Returns the `TrieAccount` that corresponds to the `Address`.
     fn account(&self, address: Address) -> Result<Option<TrieAccount>, ProviderError> {
-        let hashed_address = keccak256(address);
-        match self.state.get(hashed_address)? {
-            None => Ok(None),
-            Some(account) => {
-                // each time an account is accessed, check whether its storage trie already exists
-                // otherwise construct it from the witness data and the account's storage root
-                match self.storages.borrow_mut().entry(hashed_address) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(RlpTrie::from_prehashed(
-                            account.storage_root,
-                            &self.rlp_by_digest,
-                        )?);
-                    }
-                    Entry::Occupied(_) => {}
-                }
-
-                Ok(Some(account))
-            }
-        }
+        Ok(self.accounts.values.get(&keccak256(address)).cloned())
     }
-
-    /// Returns the storage slot value that corresponds to the given (address, slot) tuple.
     fn storage(&self, address: Address, slot: U256) -> Result<U256, ProviderError> {
-        let storages = self.storages.borrow();
-        // storage() is always be called after account(), so the storage trie must already exist
-        let storage_trie = storages.get(&keccak256(address)).unwrap();
-        Ok(storage_trie
-            .get(keccak256(B256::from(slot)))?
-            .unwrap_or(U256::ZERO))
+        let storage = self.storages.get(&keccak256(address)).unwrap();
+        Ok(storage.values.get(&keccak256(B256::from(slot))).unwrap_or(&U256::ZERO).clone())
     }
 
-    /// Computes the new state root from the HashedPostState.
     fn calculate_state_root(
         &mut self,
-        state: HashedPostState,
+        hashed_post_state: HashedPostState,
     ) -> Result<B256, StatelessValidationError> {
-        let mut removed_accounts = Vec::new();
-        for (hashed_address, account) in state.accounts {
-            // nonexisting accounts must be removed from the state
-            let Some(account) = account else {
-                removed_accounts.push(hashed_address);
-                continue;
-            };
-
-            // apply storage changes before computing the storage root
-            let storage_root = match state.storages.get(&hashed_address) {
-                None => self.storage_trie_mut(hashed_address).unwrap().hash(),
-                Some(storage) => {
-                    let storage_trie = if storage.wiped {
-                        self.clear_storage(hashed_address)
-                    } else {
-                        self.storage_trie_mut(hashed_address).unwrap()
-                    };
-
-                    // apply all state modifications
-                    for (hashed_key, value) in &storage.storage {
-                        if !value.is_zero() {
-                            storage_trie.insert(hashed_key, *value);
-                        }
-                    }
-                    // removals must happen last, otherwise unresolved orphans might still exist
-                    for (hashed_key, value) in &storage.storage {
-                        if value.is_zero() {
-                            storage_trie.remove(hashed_key);
-                        }
-                    }
-
-                    storage_trie.hash()
-                }
-            };
-
-            // update/insert the account after all changes have been processed
-            let account = TrieAccount {
-                nonce: account.nonce,
-                balance: account.balance,
-                storage_root,
-                code_hash: account.bytecode_hash.unwrap_or(KECCAK256_EMPTY),
-            };
-            self.state.insert(hashed_address, account);
+        // TODO: Partially implemented.
+        for (key, account) in hashed_post_state.accounts {
+            if account == None {
+                unimplemented!()
+            } else {
+                let account = TrieAccount {
+                    nonce: account.unwrap().nonce,
+                    balance: account.unwrap().balance,
+                    storage_root: self.accounts.values.get(&key).unwrap().storage_root,
+                    code_hash: account.unwrap().bytecode_hash.unwrap_or(KECCAK256_EMPTY),
+                };
+                self.accounts.hash_builder.add_leaf(Nibbles::unpack(key), &encode(account)[..])
+            }
         }
-        removed_accounts
-            .iter()
-            .for_each(|hashed_address| self.remove_account(hashed_address));
 
-        Ok(self.state.hash())
+        if !hashed_post_state.storages.is_empty() {
+            unimplemented!()
+        }
+
+        Ok(self.accounts.hash_builder.root())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{b256, hex, FixedBytes};
+    use super::*;
+    use alloy_primitives::hex;
     use alloy_consensus::Header;
     use alloy_primitives::hex::FromHex;
+    use alloy_trie::proof::AddedRemovedKeys;
     use reth_primitives_traits::Account;
-    use super::*;
 
     #[test]
     fn test_sparse_state() {
@@ -307,19 +268,18 @@ mod tests {
 
         let ew = ExecutionWitness { state, codes, keys, headers };
 
-        let trie = SparseState::new(&ew, pre_state_root);
+        let trie = HashBuilderSparseState::new(&ew, pre_state_root);
         assert!(trie.is_ok(), "Error creating trie");
-
         let mut trie = trie.unwrap();
-        assert_eq!(trie.0.state.inner.hash(), pre_state_root);
+        // Verify root hash
+        assert_eq!(trie.0.accounts.hash_builder.root(), pre_state_root);
+        assert_eq!(trie.0.calculate_state_root(HashedPostState::default()).unwrap(), pre_state_root);
 
+        // Calculate post-state root. Change balance value for one account.
         let mut accounts = B256Map::<Option<Account>>::default();
-        let a = trie.0.state.get(&B256::from_hex("0xdf86c581c7d7b44eecbb92fd9e5867945ec1acdc0ea5bbabda21d17dddf06473").unwrap()).unwrap().unwrap();
+        let a = trie.0.accounts.values.get(&B256::from_hex("0xdf86c581c7d7b44eecbb92fd9e5867945ec1acdc0ea5bbabda21d17dddf06473").unwrap()).unwrap();
         accounts.insert(B256::from_hex("0xdf86c581c7d7b44eecbb92fd9e5867945ec1acdc0ea5bbabda21d17dddf06473").unwrap(), Some(Account { nonce: a.nonce, balance: a.balance + U256::from(1), bytecode_hash: Some(a.code_hash.clone()) }));
         let hashed_post_state = HashedPostState{ accounts, storages: B256Map::default() };
-        // let mut accounts = B256Map::<Option<Account>>::default();
-        // accounts.insert(B256::from_hex("0xdf86c581c7d7b44eecbb92fd9e5867945ec1acdc0ea5bbabda21d17dddf06473").unwrap(), None);
-        // let hashed_post_state = HashedPostState{ accounts, storages: B256Map::default() };
 
         println!("{}", trie.0.calculate_state_root(hashed_post_state).unwrap());
     }
